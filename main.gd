@@ -14,7 +14,8 @@ const C_GOLD := Color("#E8A417")
 const C_SEA := Color("#127A99")
 const C_RISK := Color("#E0634A")
 const C_OK := Color("#3E9A62")
-const STAT_COL := {"w": Color("#4FB6D6"), "h": Color("#F07A5F"), "e": Color("#E8B53A"), "n": Color("#6BC48A")}
+const STAT_COL := {"w": Color("#4FB6D6"), "h": Color("#F07A5F"), "e": Color("#E8B53A"), "n": Color("#6BC48A"), "r": Color("#C79BEA")}
+const C_XP := Color("#9FD8F0")
 
 # ---------- oyun durumu ----------
 var lang := "tr"
@@ -22,6 +23,19 @@ var phase := "intro"   # intro, play, decide, feedback, event_anim, event, end
 var round_i := 0
 var stats := {}
 var budget := 10
+var xp := 0
+var techs: Array = []
+var turbines: Array = []
+var shown_budget := 10
+var shown_xp := 4
+var coins_flying := 0
+var coin_layer: Control
+var sfx := {}
+var coin_tick := 0
+var music := {}
+var music_now := ""
+const MUSIC := {"main": "res://music/ana_tema.mp3", "event": "res://music/olay.mp3", "final": "res://music/final.mp3"}
+const MUSIC_DB := -9.0
 var tags: Array = []
 var flags: Array = []
 var pending: Array = []
@@ -75,10 +89,17 @@ var stat_bars := {}
 var stat_vals := {}
 var stat_names := {}
 var budget_lbl: Label
+var income_lbl: Label
+var xp_lbl: Label
+var tech_btn: Button
 var period_lbl: Label
 var title_lbl: Label
 var year_chips: Array = []
 var lang_btn: Button
+var menu_btn: Button
+var prev_phase := ""
+var confirm_restart := false
+var muted := false
 var tasks_rt: RichTextLabel
 var controls_lbl: Label
 var prompt_btn: Button
@@ -104,41 +125,86 @@ func _ready() -> void:
 			call_deferred("_endtest")
 	if "--endtest" in args:
 		call_deferred("_endtest")
+	if "--menutest" in args:
+		call_deferred("_menutest")
 	reset_state()
 	build_world()
 	build_ui()
 	refresh_world()
 	show_intro()
+	play_music("main")
+
+
+# Test: menü akışını dener (--menutest)
+func _menutest() -> void:
+	_on_start()
+	open_menu()
+	assert(phase == "menu")
+	show_menu(true)
+	show_menu()
+	_on_menu_restart()
+	assert(confirm_restart)
+	_on_menu_restart()
+	assert(phase == "play")
+	near_di = 0
+	cur_di = 0
+	open_decision(0)
+	open_menu()
+	_on_lang()
+	resume_game()
+	assert(phase == "decide")
+	_on_choose(0, 0)
+	open_menu()
+	resume_game()
+	assert(phase == "feedback")
+	_on_feedback_next(false)
+	open_menu()
+	_on_menu_sound()
+	_on_menu_main()
+	assert(phase == "intro")
+	print("MENUTEST OK phase=", phase, " xp=", xp, " budget=", budget)
 
 
 # Test: tüm kararları hızlıca verip sonuç ekranını açar (?endtest)
 func _endtest() -> void:
 	_on_start()
-	for r in 3:
+	for r in D.POOLS.size():
 		round_i = r
 		for di in range(r * 3, r * 3 + 3):
 			var opts: Array = D.DEC[di]["opts"]
 			var pick := 2
 			for i in opts.size():
-				if cost_of(opts[i]) <= budget:
+				if option_cost(di, i) <= budget:
 					pick = i
 					break
 			_on_choose(di, pick)
+		phase = "play"
+		while any_buyable():
+			for td in D.TECH:
+				if can_buy(td):
+					buy_tech(td["id"])
+					break
+		phase = "play"
 		var id: String = D.POOLS[r][0]
 		evlog.append({"round": r, "id": id, "prepared": r != 1})
-		if r < 2:
-			budget += 10
+		xp += 3
+		if r < D.POOLS.size() - 1:
+			budget += income()
 	clear_overlay()
 	votes = [0, 3, 8]
 	_on_save()
-	print("ENDTEST ", stats)
+	print("ENDTEST ", stats, " techs=", techs, " xp=", xp, " income=", income())
 
 
 func reset_state() -> void:
 	phase = "intro"
 	round_i = 0
-	stats = {"w": 50, "h": 60, "e": 60, "n": 55}
+	stats = {"w": 50, "h": 60, "e": 60, "n": 55, "r": 55}
 	budget = 10
+	xp = 4
+	techs = []
+	shown_budget = budget
+	shown_xp = xp
 	tags = []
 	flags = []
 	pending = []
@@ -171,7 +237,76 @@ func cost_of(o: Dictionary) -> int:
 	var c: int = o["cost"]
 	if o.has("disc") and has_tag(o["disc"]["tag"]):
 		c = max(0, c - int(o["disc"]["amt"]))
+	for td in D.TECH:
+		if td["id"] in techs and td.has("cheap"):
+			for tg in o.get("tags", []):
+				if tg in td["cheap"]:
+					c = max(0, c - 1)
+					break
 	return c
+
+
+# Bütçe hiçbir seçeneğe yetmiyorsa en ucuz seçenek eldeki bütçeyle yapılabilir (oyun kilitlenmez)
+func option_cost(di: int, oi: int) -> int:
+	var opts: Array = D.DEC[di]["opts"]
+	var c := cost_of(opts[oi])
+	var m := 999
+	var mi := -1
+	for i in opts.size():
+		var ci := cost_of(opts[i])
+		if ci < m:
+			m = ci
+			mi = i
+	if m > budget and oi == mi:
+		return budget
+	return c
+
+
+func is_emergency(di: int) -> bool:
+	for o in D.DEC[di]["opts"]:
+		if cost_of(o) <= budget:
+			return false
+	return true
+
+
+func has_tech(id: String) -> bool:
+	return id in techs
+
+
+func tech_def(id: String) -> Dictionary:
+	for td in D.TECH:
+		if td["id"] == id:
+			return td
+	return {}
+
+
+func income() -> int:
+	var inc := 6
+	for di in choices:
+		inc += int(D.DEC[di]["opts"][choices[di]].get("inc", 0))
+	for id in techs:
+		inc += int(tech_def(id).get("inc", 0))
+	return inc
+
+
+func xp_for(o: Dictionary) -> int:
+	var g := 2
+	if o.get("tags", []).size() > 0:
+		g += 2
+	if o.get("risk", false):
+		g -= 1
+	return g
+
+
+func can_buy(td: Dictionary) -> bool:
+	return not has_tech(td["id"]) and (td["req"] == "" or has_tech(td["req"])) and xp >= int(td["cost"])
+
+
+func any_buyable() -> bool:
+	for td in D.TECH:
+		if can_buy(td):
+			return true
+	return false
 
 
 func apply_eff(eff: Dictionary) -> void:
@@ -431,8 +566,11 @@ func build_world() -> void:
 		n.add_child(ring)
 		cyl(0.12, 0.12, 9.0, Vector3(0, 4.5, 0), C_GOLD, n, 8, mat(C_GOLD, 0.5, true, 0.35))
 		var lb := label3d(tx(d["place"]), Vector3(0, 3.4, 0), n, 72)
+		cyl(0.36, 0.46, 0.9, Vector3(0, 0.45, -1.15), Color("#2A4038"), n, 12)
+		cyl(0.42, 0.42, 0.06, Vector3(0, 0.92, -1.15), C_GOLD, n, 16)
+		var cap := cyl(0.3, 0.3, 0.18, Vector3(0, 1.02, -1.15), Color("#E0453A"), n, 16, mat(Color("#E0453A"), 0.35, false, 1.0, 0.9))
 		n.visible = false
-		stations.append({"node": n, "ring": ring, "label": lb})
+		stations.append({"node": n, "ring": ring, "label": lb, "cap": cap})
 
 	# Oyuncu
 	player = CharacterBody3D.new()
@@ -527,8 +665,8 @@ func refresh_stations() -> void:
 # Karar sonrası görünür değişiklikler
 func spawn_visual(di: int, oi: int) -> void:
 	var v := visuals
-	match di:
-		0:
+	match String(D.DEC[di]["id"]):
+		"water":
 			if oi == 0:
 				for z in [-1.0, 5.0, 11.0]:
 					box(Vector3(40, 0.12, 0.3), Vector3(-10, 0.08, z), Color("#2E8FB5"), v)
@@ -539,7 +677,7 @@ func spawn_visual(di: int, oi: int) -> void:
 				for p in [Vector3(-18, 0, 10), Vector3(-14, 0, 11)]:
 					box(Vector3(0.5, 5, 0.5), p + Vector3(0, 2.5, 0), Color("#5A5A5A"), v)
 					box(Vector3(2, 0.3, 2), p + Vector3(0, 0.15, 0), Color("#7A6A55"), v)
-		1:
+		"heat":
 			if oi == 0:
 				for a in 10:
 					var ang := a * TAU / 10.0
@@ -551,7 +689,7 @@ func spawn_visual(di: int, oi: int) -> void:
 				for r in roofs.slice(0, 10):
 					var b: Node3D = r.get_parent()
 					box(Vector3(0.7, 0.5, 0.5), b.global_position + Vector3(0, 0, 1.6), Color("#9AA3A6"), v).global_position.y = 1.4
-		2:
+		"fire":
 			if oi == 0:
 				for x in [-22.0, 2.0, 22.0]:
 					box(Vector3(3, 0.06, 14), Vector3(x, 0.04, -21), Color("#A9875B"), v)
@@ -559,14 +697,14 @@ func spawn_visual(di: int, oi: int) -> void:
 				for p in [Vector3(-14, 0, -15), Vector3(12, 0, -15)]:
 					box(Vector3(0.35, 6, 0.35), p + Vector3(0, 3, 0), Color("#6B4E2E"), v)
 					box(Vector3(1.6, 0.9, 1.6), p + Vector3(0, 6.3, 0), Color("#C2412A"), v)
-		3:
+		"flood":
 			if oi == 0:
 				for x in [-22.0, -14.0, -6.0, 6.0, 14.0, 22.0, 28.0]:
 					box(Vector3(5, 0.1, 1.2), Vector3(x, 0.06, 14.3), Color("#5FA05A"), v)
 					tree(Vector3(x + 1.5, 0, 14.3), 0.5, v, true)
 			elif oi == 1:
 				box(Vector3(64, 0.9, 0.5), Vector3(0, 0.45, 14.9), Color("#9A9A94"), v)
-		4:
+		"food":
 			if oi == 0:
 				for gz in [-8.5, -4.5, -0.5]:
 					box(Vector3(5.2, 0.08, 0.15), Vector3(26, 2.3, gz), Color("#2E8FB5"), v)
@@ -576,7 +714,7 @@ func spawn_visual(di: int, oi: int) -> void:
 				box(Vector3(3.2, 0.25, 3.2), Vector3(29.5, 2.1, 4), Color("#5FA05A"), v)
 			else:
 				box(Vector3(8, 0.05, 12), Vector3(26, 0.03, -4.5), Color("#3E88B0"), v, false, mat(Color("#3E88B0"), 0.1, false, 0.6))
-		5:
+		"energy":
 			if oi == 0:
 				for r in roofs:
 					var b2: MeshInstance3D = r.get_parent()
@@ -590,7 +728,7 @@ func spawn_visual(di: int, oi: int) -> void:
 					box(Vector3(0.1, 2.2, 0.1), p + Vector3(0, 1.3, 0), Color("#8A6A45"), v)
 			else:
 				flags_hotels(v)
-		6:
+		"sea":
 			if oi == 0:
 				seagrass.visible = true
 				for i in 26:
@@ -606,7 +744,7 @@ func spawn_visual(di: int, oi: int) -> void:
 					tree(Vector3(x, 0.2, 16.3), 0.4, v, true)
 			else:
 				box(Vector3(60, 0.1, 3), Vector3(0, -0.02, 19.5), Color("#E6D3A3"), v)
-		7:
+		"waste":
 			var mound: Node3D = get_node("Mound")
 			if oi == 0:
 				mound.scale = Vector3(0.9, 0.35, 0.7)
@@ -617,7 +755,7 @@ func spawn_visual(di: int, oi: int) -> void:
 				cyl(0.35, 0.45, 6, Vector3(-27.6, 3, -6), Color("#7A7F80"), v)
 			else:
 				mound.scale = Vector3(1.9, 0.8, 1.5)
-		8:
+		"warn":
 			if oi == 0:
 				box(Vector3(0.3, 7, 0.3), Vector3(10.6, 3.5, -6.5), Color("#9AA3A6"), v)
 				box(Vector3(1, 0.6, 1), Vector3(10.6, 7.2, -6.5), Color("#F2F4EF"), v)
@@ -628,6 +766,86 @@ func spawn_visual(di: int, oi: int) -> void:
 				for i in 4:
 					box(Vector3(0.08, 2, 0.08), Vector3(-4 + i * 1.3, 1, -6.8), Color("#8A6A45"), v)
 					box(Vector3(0.7, 0.45, 0.04), Vector3(-3.65 + i * 1.3, 1.75, -6.8), [C_SEA, C_GOLD, C_OK, C_RISK][i], v)
+		"transit":
+			if oi == 0:
+				box(Vector3(64, 0.08, 0.15), Vector3(0, 0.08, 12.1), Color("#8A8F8C"), v)
+				box(Vector3(64, 0.08, 0.15), Vector3(0, 0.08, 13.1), Color("#8A8F8C"), v)
+				box(Vector3(6, 1.6, 1.4), Vector3(-6, 0.9, 12.6), Color("#3E9A62"), v)
+				box(Vector3(6.05, 0.5, 1.45), Vector3(-6, 1.2, 12.6), Color("#F2F4EF"), v)
+				box(Vector3(64, 0.07, 0.8), Vector3(0, 0.07, 11.0), Color("#5FA05A"), v)
+			elif oi == 1:
+				for x in [-14.0, 2.0, 18.0]:
+					box(Vector3(4, 1.6, 1.4), Vector3(x, 0.9, 12.6), Color("#127A99"), v)
+					box(Vector3(4.05, 0.4, 1.45), Vector3(x, 1.3, 12.6), Color("#F2F4EF"), v)
+			else:
+				box(Vector3(64, 0.07, 3.0), Vector3(0, 0.05, -15.0), Color("#3A3E3C"), v)
+				for x in [-20.0, -6.0, 9.0, 22.0]:
+					box(Vector3(1.8, 0.8, 1.0), Vector3(x, 0.45, -15.4), Color("#B4553C"), v)
+		"market":
+			if oi == 0:
+				for q in 5:
+					var c2: Color = [C_GOLD, C_OK, Color("#C79BEA"), C_RISK, C_SEA][q]
+					box(Vector3(1.4, 0.9, 1.0), Vector3(9.5 + q * 1.5, 0.45, 4.6), Color("#C9A36A"), v)
+					cyl(0.0, 0.95, 0.7, Vector3(9.5 + q * 1.5, 1.25, 4.6), c2, v, 4)
+			elif oi == 1:
+				for q in 3:
+					box(Vector3(0.1, 1.6, 0.1), Vector3(10 + q * 2.5, 0.8, 4.5), Color("#8A6A45"), v)
+					box(Vector3(1.6, 1.0, 0.08), Vector3(10 + q * 2.5, 1.9, 4.5), C_OK, v)
+			else:
+				box(Vector3(6, 3.4, 3.2), Vector3(12.5, 1.7, -0.6), Color("#C8CCD0"), v)
+				box(Vector3(6.1, 0.6, 3.3), Vector3(12.5, 3.1, -0.6), Color("#C2412A"), v)
+		"agrivolt":
+			if oi == 0:
+				for q in 4:
+					var pn2 := box(Vector3(2.4, 0.08, 1.4), Vector3(19 + q * 2.7, 0.7, 3.2), Color("#24456B"), v, false, mat(Color("#24456B"), 0.2))
+					pn2.rotation_degrees.x = -20
+			elif oi == 1:
+				for q in 6:
+					var px := 19.0 + (q % 3) * 2.2
+					var pz := -15.0 + int(q / 3) * 2.4
+					tree(Vector3(px, 0, pz), 0.55, v, true)
+					sphere(0.12, Vector3(px + 0.3, 0.9, pz + 0.3), Color("#F08A1F"), v)
+					var pn3 := box(Vector3(1.8, 0.06, 1.2), Vector3(px, 2.2, pz), Color("#24456B"), v, false, mat(Color("#24456B"), 0.2))
+					pn3.rotation_degrees.x = -15
+			else:
+				box(Vector3(4, 3, 3), Vector3(28, 1.5, -14.5), Color("#9AA3A6"), v)
+				for q in 2:
+					cyl(0.4, 0.5, 7, Vector3(26.8 + q * 1.4, 3.5, -15.3), Color("#7A7F80"), v)
+					sphere(0.9, Vector3(26.8 + q * 1.4, 7.6, -15.3), Color("#8F9496"), v, mat(Color("#8F9496"), 0.9, false, 0.6))
+		"care":
+			if oi == 0:
+				box(Vector3(2.4, 1.6, 1.6), Vector3(-13.2, 0.8, -4.6), Color("#F1EDE4"), v)
+				box(Vector3(2.5, 0.2, 1.7), Vector3(-13.2, 1.7, -4.6), C_OK, v)
+			elif oi == 1:
+				for q in 4:
+					box(Vector3(0.12, 1.8, 0.12), Vector3(-7 + (q % 2) * 2, 0.9, -3.8 + int(q / 2) * 1.6), Color("#8A6A45"), v)
+				box(Vector3(2.6, 0.1, 2.2), Vector3(-6, 1.85, -3.0), Color("#F7F7F2"), v)
+		"watershed":
+			if oi == 0:
+				for q in 12:
+					tree(Vector3(-20 + (q % 6) * 1.6, 0, -14.6 + int(q / 6) * 1.1), 0.45, v)
+				for q in 3:
+					box(Vector3(10, 0.12, 0.35), Vector3(-16, 0.06, -12.9 - q * 0.9), Color("#9A7B52"), v)
+			elif oi == 1:
+				box(Vector3(9, 2.6, 0.8), Vector3(-19, 1.3, -15.6), Color("#B9B3A3"), v)
+				box(Vector3(9, 0.1, 3), Vector3(-19, 1.9, -17.4), Color("#2E8FB5"), v)
+			else:
+				box(Vector3(7, 0.12, 4), Vector3(-12, 0.07, -15.0), Color("#8C8578"), v)
+				box(Vector3(0.3, 4, 0.3), Vector3(-10, 2, -15.5), C_GOLD, v)
+				box(Vector3(3, 0.3, 0.3), Vector3(-11.2, 3.9, -15.5), C_GOLD, v)
+		"plan":
+			if oi == 0:
+				box(Vector3(5, 2.6, 3), Vector3(12.0, 1.3, -12.6), Color("#F1EDE4"), v)
+				box(Vector3(3.2, 1.6, 0.1), Vector3(12.0, 1.6, -11.05), Color("#127A99"), v, false, mat(Color("#127A99"), 0.3, true))
+				var pl := label3d("2050", Vector3(12.0, 1.6, -10.95), v, 60)
+				pl.billboard = BaseMaterial3D.BILLBOARD_DISABLED
+			elif oi == 1:
+				for q in 3:
+					var rr := cyl(2.4 - q * 0.6, 2.4 - q * 0.6, 0.3, Vector3(12.0, 0.15 + q * 0.3, -12.6), Color("#D9D2C1"), v, 24)
+					rr.name = "seat%d" % q
+				for q in 3:
+					box(Vector3(0.08, 2.4, 0.08), Vector3(10.5 + q * 1.5, 1.2, -14.8), Color("#8A6A45"), v)
+					box(Vector3(0.7, 0.45, 0.04), Vector3(10.85 + q * 1.5, 2.1, -14.8), [C_SEA, C_GOLD, C_OK][q], v)
 
 
 func flags_hotels(v: Node3D) -> void:
@@ -775,13 +993,17 @@ func build_ui() -> void:
 		stat_vals[k] = vl
 	budget_lbl = lbl("", 18, C_GOLD)
 	v.add_child(budget_lbl)
+	income_lbl = lbl("", 14, C_MUTED)
+	v.add_child(income_lbl)
+	xp_lbl = lbl("", 17, C_XP)
+	v.add_child(xp_lbl)
 
 	# Sağ üst: yıllar ve dil
 	var tr_box := HBoxContainer.new()
 	tr_box.add_theme_constant_override("separation", 6)
 	pin(tr_box, 1, 0, -16, 16, Control.GROW_DIRECTION_BEGIN, Control.GROW_DIRECTION_END)
 	hud.add_child(tr_box)
-	for y in ["2030", "2040", "2050"]:
+	for y in D.YEARS:
 		var chip := PanelContainer.new()
 		chip.mouse_filter = Control.MOUSE_FILTER_IGNORE
 		var cl := lbl(y, 15, C_TEXT)
@@ -815,18 +1037,47 @@ func build_ui() -> void:
 	prompt_btn.visible = false
 	hud.add_child(prompt_btn)
 
+	tech_btn = btn("", false, 17)
+	tech_btn.pressed.connect(open_tech)
+	pin(tech_btn, 1, 1, -16, -16, Control.GROW_DIRECTION_BEGIN, Control.GROW_DIRECTION_BEGIN)
+	hud.add_child(tech_btn)
+
 	toast_lbl = lbl("", 20, C_TEXT)
 	toast_lbl.add_theme_constant_override("outline_size", 8)
 	toast_lbl.add_theme_color_override("font_outline_color", C_INK)
 	toast_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	pin(toast_lbl, 0.5, 0, 0, 24, Control.GROW_DIRECTION_BOTH, Control.GROW_DIRECTION_END)
-	hud.add_child(toast_lbl)
+	ui.add_child(toast_lbl)
 
 	overlay = Control.new()
 	overlay.set_anchors_preset(Control.PRESET_FULL_RECT)
 	overlay.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	ui.add_child(overlay)
+	menu_btn = btn("", false, 15)
+	menu_btn.pressed.connect(open_menu)
+	ui.add_child(menu_btn)
+	pin(menu_btn, 1, 0, -16, 108, Control.GROW_DIRECTION_BEGIN, Control.GROW_DIRECTION_END)
 	ui.move_child(lang_btn, ui.get_child_count() - 1)
+	coin_layer = Control.new()
+	coin_layer.set_anchors_preset(Control.PRESET_FULL_RECT)
+	coin_layer.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	ui.add_child(coin_layer)
+	for k in ["press", "stamp", "coin"]:
+		var ap := AudioStreamPlayer.new()
+		ap.stream = make_sfx(k)
+		ap.max_polyphony = 6
+		ap.volume_db = -6.0 if k != "coin" else -10.0
+		add_child(ap)
+		sfx[k] = ap
+	for mk in MUSIC:
+		var st = load(MUSIC[mk])
+		if st is AudioStreamMP3:
+			st.loop = mk != "event"
+			var mp := AudioStreamPlayer.new()
+			mp.stream = st
+			mp.volume_db = -60.0
+			add_child(mp)
+			music[mk] = mp
 	refresh_hud()
 
 
@@ -836,7 +1087,18 @@ func refresh_hud() -> void:
 		stat_bars[k].value = stats[k]
 		stat_vals[k].text = str(stats[k])
 		stat_vals[k].add_theme_color_override("font_color", C_RISK if stats[k] < 25 else C_TEXT)
-	budget_lbl.text = "%s: %d %s" % [t("budget"), budget, t("unit")]
+	if coins_flying == 0:
+		shown_budget = budget
+		shown_xp = xp
+	else:
+		shown_budget = mini(shown_budget, budget)
+		shown_xp = mini(shown_xp, xp)
+	budget_lbl.text = "%s: %d %s" % [t("budget"), shown_budget, t("unit")]
+	income_lbl.text = "%s: +%d %s %s" % [t("income"), income(), t("unit"), t("perDecade")]
+	xp_lbl.text = "%s: %d" % [t("xp"), shown_xp]
+	tech_btn.text = "%s   (%d XP)" % [t("techBtn"), shown_xp]
+	tech_btn.add_theme_stylebox_override("normal", sb(Color("#1F5A72") if any_buyable() else C_INK2, 10, 12, C_XP if any_buyable() else C_LINE))
+	tech_btn.visible = phase in ["play", "tech"]
 	period_lbl.text = t("period")[round_i] if phase != "end" else "2050"
 	for i in year_chips.size():
 		var col := C_INK2
@@ -846,6 +1108,9 @@ func refresh_hud() -> void:
 			col = C_SEA
 		year_chips[i].add_theme_stylebox_override("panel", sb(col, 8, 6))
 	lang_btn.text = t("lang")
+	if menu_btn:
+		menu_btn.text = "%s  (Esc)" % t("menu")
+		menu_btn.visible = phase in ["play", "decide", "feedback", "event", "tech"]
 	controls_lbl.text = t("controls")
 	var s := "[color=#%s]%s[/color]\n" % [C_GOLD.to_html(false), t("tasks")]
 	for i in range(round_i * 3, round_i * 3 + 3):
@@ -855,7 +1120,7 @@ func refresh_hud() -> void:
 		else:
 			s += "  • [b]%s[/b]: %s\n" % [tx(d["place"]), tx(d["title"])]
 	tasks_rt.text = s.strip_edges()
-	hud.visible = phase in ["play", "decide", "feedback", "event_anim", "event"]
+	hud.visible = phase in ["play", "pressing", "decide", "feedback", "event_anim", "event", "tech"]
 
 
 func clear_overlay() -> void:
@@ -932,6 +1197,8 @@ func open_decision(di: int) -> void:
 	v.add_child(lbl("%s · %s" % [t("period")[round_i], tx(d["place"]).to_upper()], 15, C_GOLD))
 	v.add_child(lbl(tx(d["title"]), 32, C_TEXT, true))
 	v.add_child(lbl(tx(d["ctx"]), 18, C_MUTED, true))
+	if is_emergency(di):
+		v.add_child(lbl(t("emergency"), 16, C_GOLD, true))
 	var vp := get_viewport().get_visible_rect().size
 	var grid := GridContainer.new()
 	grid.columns = 3 if vp.x > 820 else 1
@@ -941,7 +1208,7 @@ func open_decision(di: int) -> void:
 	var first_btn: Button = null
 	for oi in d["opts"].size():
 		var o: Dictionary = d["opts"][oi]
-		var c := cost_of(o)
+		var c := option_cost(di, oi)
 		var afford := c <= budget
 		var card := PanelContainer.new()
 		card.add_theme_stylebox_override("panel", sb(C_INK2, 12, 14, C_LINE))
@@ -967,6 +1234,9 @@ func open_decision(di: int) -> void:
 			extra.append("[color=#%s]%s[/color]" % [C_RISK.to_html(false), t("risk")])
 		if o.has("later"):
 			extra.append("[color=#%s]%s[/color]" % [C_RISK.to_html(false), t("later")])
+		if o.has("inc"):
+			extra.append("[color=#%s]%s +%d %s[/color]" % [C_GOLD.to_html(false), t("income"), o["inc"], t("perDecade")])
+		extra.append("[color=#%s]+%d %s[/color]" % [C_XP.to_html(false), xp_for(o), t("xpGain")])
 		if extra.size() > 0:
 			cv.add_child(rt("\n".join(extra), 14))
 		var spacer := Control.new()
@@ -992,9 +1262,36 @@ func show_feedback(di: int, oi: int) -> void:
 	var d: Dictionary = D.DEC[di]
 	var o: Dictionary = d["opts"][oi]
 	var v := open_panel(820, 0.25)
-	v.add_child(lbl(t("yourChoice").to_upper(), 15, C_GOLD))
-	v.add_child(lbl(tx(o["label"]), 30, C_TEXT, true))
-	v.add_child(rt(eff_bb(o["eff"], true) + "   [color=#%s]%s -%d[/color]" % [C_GOLD.to_html(false), t("budget"), last_paid], 17))
+	var top := HBoxContainer.new()
+	var tv := VBoxContainer.new()
+	tv.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	tv.add_child(lbl(t("yourChoice").to_upper(), 15, C_GOLD))
+	tv.add_child(lbl(tx(o["label"]), 30, C_TEXT, true))
+	top.add_child(tv)
+	var holder := Control.new()
+	holder.custom_minimum_size = Vector2(230, 80)
+	top.add_child(holder)
+	v.add_child(top)
+	var stamp := PanelContainer.new()
+	var ss := sb(Color(0, 0, 0, 0), 8, 10, C_RISK)
+	ss.set_border_width_all(4)
+	stamp.add_theme_stylebox_override("panel", ss)
+	var sl := lbl(t("approved"), 30, C_RISK)
+	sl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	stamp.add_child(sl)
+	stamp.custom_minimum_size = Vector2(220, 64)
+	stamp.position = Vector2(5, 8)
+	stamp.pivot_offset = Vector2(110, 32)
+	stamp.rotation_degrees = -9.0
+	stamp.scale = Vector2(2.4, 2.4)
+	stamp.modulate.a = 0.0
+	holder.add_child(stamp)
+	var stw := create_tween()
+	stw.tween_interval(0.15)
+	stw.tween_property(stamp, "scale", Vector2.ONE, 0.22).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
+	stw.parallel().tween_property(stamp, "modulate:a", 1.0, 0.12)
+	stw.tween_callback(play_sfx.bind("stamp"))
+	v.add_child(rt(eff_bb(o["eff"], true) + "   [color=#%s]%s -%d[/color]   [color=#%s]+%d %s[/color]" % [C_GOLD.to_html(false), t("budget"), last_paid, C_XP.to_html(false), xp_for(o), t("xpGain")], 17))
 	var fp := PanelContainer.new()
 	fp.add_theme_stylebox_override("panel", sb(Color("#2B2A1A"), 10, 14, C_GOLD.darkened(0.3)))
 	var fv := VBoxContainer.new()
@@ -1034,7 +1331,11 @@ func show_event_panel() -> void:
 		wv.size_flags_horizontal = Control.SIZE_SHRINK_BEGIN
 		wv.add_child(lbl(t("warnOk"), 16, Color.WHITE))
 		v.add_child(wv)
-	v.add_child(rt(eff_bb(ev["dmg"], true), 18))
+	if ev["tech"]:
+		v.add_child(lbl(t("dmgLess"), 16, C_XP, true))
+	if ev["fair"]:
+		v.add_child(lbl(t("fairOk"), 16, STAT_COL["r"], true))
+	v.add_child(rt(eff_bb(ev["dmg"], true) + "   [color=#%s]+%d %s[/color]" % [C_XP.to_html(false), ev["xp"], t("xpGain")], 18))
 	if ev["later"].size() > 0:
 		v.add_child(lbl(t("delayed").to_upper(), 14, C_GOLD))
 		for p in ev["later"]:
@@ -1050,13 +1351,14 @@ func show_event_panel() -> void:
 
 func show_end() -> void:
 	phase = "end"
+	play_music("final")
 	cam_mode = "orbit"
 	refresh_stations()
 	refresh_hud()
 	var avg := 0
 	for k in D.KEYS:
 		avg += stats[k]
-	avg = int(round(avg / 4.0))
+	avg = int(round(avg / float(D.KEYS.size())))
 	var gr: Dictionary = D.GRADES[2]
 	for g in D.GRADES:
 		if avg >= int(g["min"]):
@@ -1075,13 +1377,18 @@ func show_end() -> void:
 	for k in D.KEYS:
 		sline += "[color=#%s]%s %d[/color]     " % [STAT_COL[k].to_html(false), t(k), stats[k]]
 	v.add_child(rt(sline, 18))
+	v.add_child(lbl(t("techs").to_upper(), 14, C_MUTED))
+	var tn := []
+	for id in techs:
+		tn.append(tx(tech_def(id)["name"]))
+	v.add_child(lbl(", ".join(tn) if tn.size() > 0 else t("noTech"), 16, C_XP, true))
 	v.add_child(lbl(t("journey").to_upper(), 14, C_MUTED))
 	var g1 := GridContainer.new()
 	g1.columns = 3
 	g1.add_theme_constant_override("h_separation", 16)
 	v.add_child(g1)
 	for r in log_list:
-		g1.add_child(lbl(["2030", "2040", "2050"][r["round"]], 15, C_MUTED))
+		g1.add_child(lbl(D.YEARS[r["round"]], 15, C_MUTED))
 		var tl := lbl(tx(D.DEC[r["di"]]["title"]), 15, C_MUTED, true)
 		tl.custom_minimum_size.x = 260
 		g1.add_child(tl)
@@ -1094,7 +1401,7 @@ func show_end() -> void:
 	g2.add_theme_constant_override("h_separation", 16)
 	v.add_child(g2)
 	for e in evlog:
-		g2.add_child(lbl(["2030", "2040", "2050"][e["round"]], 15, C_MUTED))
+		g2.add_child(lbl(D.YEARS[e["round"]], 15, C_MUTED))
 		g2.add_child(lbl(tx(D.EVENTS[e["id"]]["title"]), 15, C_TEXT))
 		g2.add_child(lbl(t("ok") if e["prepared"] else t("bad"), 15, C_OK.lightened(0.3) if e["prepared"] else C_RISK))
 	var vp := PanelContainer.new()
@@ -1204,10 +1511,20 @@ func start_event() -> void:
 			prepared = true
 	var base: Dictionary = E["prot"] if prepared else E["dmg"]
 	var warn := has_tag("warn")
+	var mult := 1.0
+	for id2 in techs:
+		var md: Dictionary = tech_def(id2).get("mult", {})
+		if md.has(id):
+			mult *= float(md[id])
+	if warn:
+		mult *= 0.5
+	var fair := has_tech("fair")
 	var dmg := {}
 	for k in D.KEYS:
 		if base.has(k):
-			dmg[k] = int(round(base[k] / 2.0)) if warn else int(base[k])
+			var m2 := mult * (0.5 if (k == "r" and fair) else 1.0)
+			dmg[k] = int(round(float(base[k]) * m2))
+	var gain := 3 if prepared else 1
 	var later := []
 	var keep := []
 	for p in pending:
@@ -1216,14 +1533,17 @@ func start_event() -> void:
 		else:
 			keep.append(p)
 	pending = keep
-	ev = {"id": id, "prepared": prepared, "warn": warn, "dmg": dmg, "later": later}
+	ev = {"id": id, "prepared": prepared, "warn": warn, "dmg": dmg, "later": later, "tech": mult < (0.5 if warn else 1.0) - 0.001, "fair": fair and base.has("r"), "xp": gain}
+	xp += gain
 	evlog.append({"round": round_i, "id": id, "prepared": prepared})
 	toast(tx(E["title"]))
+	play_music("event")
 	await play_event_fx(id, prepared)
 	apply_eff(dmg)
 	for p in later:
 		apply_eff(p["eff"])
 	refresh_world()
+	fly(gain, "xp", get_viewport().get_visible_rect().size / 2.0)
 	show_event_panel()
 
 
@@ -1295,10 +1615,391 @@ func clear_event_fx() -> void:
 	refresh_world()
 
 
+
+# =====================================================================
+#  SES VE ANİMASYON YARDIMCILARI
+# =====================================================================
+func make_sfx(kind: String) -> AudioStreamWAV:
+	var rate := 22050
+	var dur := 0.18
+	match kind:
+		"stamp":
+			dur = 0.28
+		"coin":
+			dur = 0.14
+	var n := int(rate * dur)
+	var data := PackedByteArray()
+	data.resize(n * 2)
+	var ph := 0.0
+	var rng2 := RandomNumberGenerator.new()
+	rng2.seed = 7
+	for i in n:
+		var tt := float(i) / rate
+		var k := tt / dur
+		var v := 0.0
+		match kind:
+			"press":
+				var f := 420.0 + 600.0 * k
+				ph += TAU * f / rate
+				v = (0.6 * sign(sin(ph)) * 0.35 + 0.65 * sin(ph)) * pow(1.0 - k, 2.0)
+				if i < 220:
+					v += rng2.randf_range(-0.8, 0.8) * (1.0 - i / 220.0)
+			"stamp":
+				var f2 := 140.0 - 80.0 * k
+				ph += TAU * f2 / rate
+				v = sin(ph) * exp(-k * 7.0) * 1.1
+				if i < 700:
+					v += rng2.randf_range(-1.0, 1.0) * 0.6 * (1.0 - i / 700.0)
+			"coin":
+				var f3 := 1320.0 if k < 0.35 else 1980.0
+				ph += TAU * f3 / rate
+				v = sin(ph) * exp(-k * 4.0) * 0.7
+		data.encode_s16(i * 2, int(clampf(v, -1.0, 1.0) * 26000.0))
+	var w := AudioStreamWAV.new()
+	w.format = AudioStreamWAV.FORMAT_16_BITS
+	w.mix_rate = rate
+	w.stereo = false
+	w.data = data
+	return w
+
+
+# Müzik: parçalar arasında yumuşak geçiş
+func play_music(kind: String) -> void:
+	if kind == music_now or not music.has(kind):
+		return
+	music_now = kind
+	for mk in music:
+		var mp: AudioStreamPlayer = music[mk]
+		if mk == kind:
+			if not mp.playing:
+				mp.volume_db = -40.0
+				mp.play()
+			create_tween().tween_property(mp, "volume_db", MUSIC_DB, 1.2)
+		elif mp.playing:
+			var tw := create_tween()
+			tw.tween_property(mp, "volume_db", -60.0, 1.2)
+			tw.tween_callback(mp.stop)
+
+
+func play_sfx(kind: String) -> void:
+	if sfx.has(kind):
+		sfx[kind].play()
+
+
+# Kazanılan altın (bütçe) ve kristallerin (Eko-XP) ekrandaki sayaçlara uçması
+func fly(amount: int, kind: String, from: Vector2) -> void:
+	if amount <= 0 or coin_layer == null:
+		return
+	var target_ctrl: Control = budget_lbl if kind == "gold" else xp_lbl
+	var target := target_ctrl.get_global_rect().get_center()
+	var count := mini(amount, 14)
+	var per := int(ceil(float(amount) / count))
+	var left := amount
+	for i in count:
+		var step := mini(per, left)
+		left -= step
+		var c := Panel.new()
+		var st := StyleBoxFlat.new()
+		if kind == "gold":
+			st.bg_color = Color("#F2C14E")
+			st.border_color = Color("#A8740C")
+			st.set_corner_radius_all(11)
+		else:
+			st.bg_color = C_XP
+			st.border_color = Color("#2E8FB5")
+			st.set_corner_radius_all(3)
+		st.set_border_width_all(2)
+		c.add_theme_stylebox_override("panel", st)
+		c.size = Vector2(22, 22)
+		c.pivot_offset = Vector2(11, 11)
+		c.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		if kind != "gold":
+			c.rotation_degrees = 45.0
+		var start := from + Vector2(randf_range(-70, 70), randf_range(-50, 40))
+		c.position = start - c.size / 2.0
+		c.scale = Vector2.ZERO
+		coin_layer.add_child(c)
+		coins_flying += 1
+		var tw := create_tween()
+		tw.tween_interval(i * 0.07)
+		tw.tween_property(c, "scale", Vector2(1.2, 1.2), 0.15).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
+		var mid := start.lerp(target, 0.5) + Vector2(0, -90)
+		tw.tween_method(func(tv: float): c.position = start.lerp(mid, tv).lerp(mid.lerp(target, tv), tv) - c.size / 2.0, 0.0, 1.0, 0.6).set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN)
+		tw.parallel().tween_property(c, "scale", Vector2(0.6, 0.6), 0.6)
+		tw.tween_callback(_coin_arrived.bind(c, kind, step))
+
+
+func _coin_arrived(c: Control, kind: String, step: int) -> void:
+	c.queue_free()
+	coins_flying = maxi(0, coins_flying - 1)
+	if kind == "gold":
+		shown_budget = mini(shown_budget + step, budget)
+		budget_lbl.text = "%s: %d %s" % [t("budget"), shown_budget, t("unit")]
+		budget_lbl.modulate = Color(1.6, 1.4, 0.8)
+		create_tween().tween_property(budget_lbl, "modulate", Color.WHITE, 0.25)
+	else:
+		shown_xp = mini(shown_xp + step, xp)
+		xp_lbl.text = "%s: %d" % [t("xp"), shown_xp]
+		tech_btn.text = "%s   (%d XP)" % [t("techBtn"), shown_xp]
+		xp_lbl.modulate = Color(1.5, 1.6, 1.8)
+		create_tween().tween_property(xp_lbl, "modulate", Color.WHITE, 0.25)
+	coin_tick += 1
+	if coin_tick % 2 == 0:
+		play_sfx("coin")
+	if coins_flying == 0:
+		refresh_hud()
+
+
+# =====================================================================
+#  DURAKLATMA MENÜSÜ
+# =====================================================================
+func open_menu() -> void:
+	if phase == "menu":
+		return
+	if not phase in ["play", "decide", "feedback", "event", "tech"]:
+		return
+	prev_phase = phase
+	phase = "menu"
+	confirm_restart = false
+	click_target = null
+	target_marker.visible = false
+	prompt_btn.visible = false
+	show_menu()
+
+
+func show_menu(howto := false) -> void:
+	var v := open_panel(520, 0.6)
+	v.add_child(lbl(t("paused").to_upper(), 15, C_GOLD))
+	v.add_child(lbl("Antalya 2050", 34, C_TEXT))
+	v.add_child(lbl("%s  ·  %s %d  ·  %s %d" % [t("period")[round_i], t("budget"), budget, t("xp"), xp], 15, C_MUTED, true))
+	if howto:
+		var hs := ""
+		for i in t("how").size():
+			hs += "[color=#%s]%d.[/color]  %s\n" % [C_GOLD.to_html(false), i + 1, t("how")[i]]
+		v.add_child(rt(hs.strip_edges(), 16))
+		v.add_child(lbl(t("controls"), 14, C_MUTED, true))
+		var bk := btn(t("back"), false, 17)
+		bk.pressed.connect(show_menu)
+		v.add_child(bk)
+		bk.grab_focus()
+		return
+	var items := [
+		[t("resume"), resume_game, true],
+		[t("howto"), show_menu.bind(true), false],
+		[t("sure") if confirm_restart else t("restart"), _on_menu_restart, false],
+		[t("mainMenu"), _on_menu_main, false],
+		[t("soundOff") if muted else t("soundOn"), _on_menu_sound, false],
+		[t("fullscreen"), _on_menu_fullscreen, false],
+	]
+	if not OS.has_feature("web"):
+		items.append([t("quit"), _on_menu_quit, false])
+	var first: Button = null
+	for it in items:
+		var b := btn(it[0], it[2], 18)
+		b.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		b.pressed.connect(it[1])
+		if it[1] == _on_menu_restart and confirm_restart:
+			b.add_theme_stylebox_override("normal", sb(C_RISK, 10, 12))
+			b.add_theme_color_override("font_color", Color.WHITE)
+		v.add_child(b)
+		if first == null:
+			first = b
+	first.grab_focus()
+	refresh_hud()
+
+
+func resume_game() -> void:
+	if phase != "menu":
+		return
+	phase = prev_phase
+	clear_overlay()
+	match phase:
+		"decide": open_decision(cur_di)
+		"feedback": show_feedback(cur_di, choices[cur_di])
+		"event": show_event_panel()
+		"tech":
+			phase = "play"
+			open_tech()
+		_:
+			phase = "play"
+	refresh_hud()
+
+
+func _on_menu_restart() -> void:
+	if not confirm_restart:
+		confirm_restart = true
+		show_menu()
+		return
+	confirm_restart = false
+	clear_event_fx()
+	_on_start()
+
+
+func _on_menu_main() -> void:
+	clear_event_fx()
+	reset_world_state()
+	show_intro()
+	play_music("main")
+
+
+func _on_menu_sound() -> void:
+	muted = not muted
+	AudioServer.set_bus_mute(0, muted)
+	show_menu()
+
+
+func _on_menu_fullscreen() -> void:
+	var fs := DisplayServer.window_get_mode() == DisplayServer.WINDOW_MODE_FULLSCREEN
+	DisplayServer.window_set_mode(DisplayServer.WINDOW_MODE_WINDOWED if fs else DisplayServer.WINDOW_MODE_FULLSCREEN)
+
+
+func _on_menu_quit() -> void:
+	get_tree().quit()
+
+
+# =====================================================================
+#  TEKNOLOJİ AĞACI
+# =====================================================================
+func open_tech() -> void:
+	if phase != "play" and phase != "tech":
+		return
+	phase = "tech"
+	click_target = null
+	target_marker.visible = false
+	prompt_btn.visible = false
+	var v := open_panel(1080, 0.5, true)
+	v.add_child(lbl(("%s · %d XP" % [t("xp"), xp]).to_upper(), 15, C_XP))
+	var hrow := HBoxContainer.new()
+	var ttl := lbl(t("tech"), 30, C_TEXT)
+	ttl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	hrow.add_child(ttl)
+	var cb0 := btn(t("close"), false, 16)
+	cb0.pressed.connect(close_tech)
+	hrow.add_child(cb0)
+	v.add_child(hrow)
+	v.add_child(lbl(t("techP"), 15, C_MUTED, true))
+	var grid := GridContainer.new()
+	grid.columns = 3
+	grid.add_theme_constant_override("h_separation", 12)
+	grid.add_theme_constant_override("v_separation", 10)
+	v.add_child(grid)
+	for b in 3:
+		var hl := lbl(t("branches")[b].to_upper(), 14, C_GOLD)
+		grid.add_child(hl)
+	for tier in 3:
+		for b in 3:
+			var td: Dictionary = {}
+			for x in D.TECH:
+				if int(x["branch"]) == b and int(x["tier"]) == tier:
+					td = x
+			var card := PanelContainer.new()
+			var owned := has_tech(td["id"])
+			var unlocked: bool = td["req"] == "" or has_tech(td["req"])
+			var border := C_OK if owned else (C_XP if can_buy(td) else C_LINE)
+			card.add_theme_stylebox_override("panel", sb(Color("#183A33") if owned else C_INK2, 12, 12, border))
+			card.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+			card.modulate.a = 1.0 if (owned or unlocked) else 0.55
+			grid.add_child(card)
+			var cv := VBoxContainer.new()
+			cv.add_theme_constant_override("separation", 6)
+			card.add_child(cv)
+			var nl := lbl(tx(td["name"]), 18, C_TEXT, true)
+			nl.custom_minimum_size.x = 290
+			cv.add_child(nl)
+			cv.add_child(lbl(tx(td["desc"]), 13, C_MUTED, true))
+			var sp := Control.new()
+			sp.size_flags_vertical = Control.SIZE_EXPAND_FILL
+			cv.add_child(sp)
+			if owned:
+				cv.add_child(lbl(t("learned"), 16, C_OK.lightened(0.3)))
+			elif not unlocked:
+				cv.add_child(lbl("%s: %s" % [t("needs"), tx(tech_def(td["req"])["name"])], 14, C_MUTED, true))
+			else:
+				var bb := btn("%s · %d XP" % [t("learn"), td["cost"]], true, 16)
+				bb.disabled = xp < int(td["cost"])
+				bb.pressed.connect(buy_tech.bind(td["id"]))
+				cv.add_child(bb)
+	var cb := btn(t("close"), false, 16)
+	cb.size_flags_horizontal = Control.SIZE_SHRINK_BEGIN
+	cb.pressed.connect(close_tech)
+	v.add_child(cb)
+	refresh_hud()
+
+
+func close_tech() -> void:
+	clear_overlay()
+	phase = "play"
+	refresh_hud()
+
+
+func buy_tech(id: String) -> void:
+	var td := tech_def(id)
+	if td.is_empty() or not can_buy(td):
+		return
+	xp -= int(td["cost"])
+	techs.append(id)
+	apply_eff(td.get("eff", {}))
+	spawn_tech_visual(id)
+	refresh_world()
+	toast(tx(td["name"]))
+	open_tech()
+
+
+func spawn_tech_visual(id: String) -> void:
+	var v := visuals
+	match id:
+		"cistern":
+			box(Vector3(3.2, 1.6, 2.2), Vector3(-29.5, 0.8, 3), Color("#C8B58E"), v)
+			box(Vector3(1.2, 1.0, 0.1), Vector3(-29.5, 0.6, 4.12), Color("#3B3326"), v)
+			box(Vector3(3.6, 0.3, 2.6), Vector3(-29.5, 1.75, 3), Color("#B09E78"), v)
+		"smartgrid":
+			for q in 4:
+				cyl(0.12, 0.12, 3.0, Vector3(-21.5 + (q % 2) * 1.4, 1.5, -6.5 + int(q / 2) * 1.4), Color("#7A7F80"), v, 6)
+			cyl(1.3, 1.3, 1.6, Vector3(-20.8, 3.6, -5.8), Color("#2E8FB5"), v)
+		"vertical":
+			box(Vector3(3, 9, 3), Vector3(30, 4.5, -12.5), Color("#D9F0E6"), v, false, mat(Color("#BFE8D2"), 0.2, false, 0.75))
+			for fy in range(1, 9):
+				box(Vector3(2.6, 0.18, 2.6), Vector3(30, fy, -12.5), Color("#4FA35A"), v)
+		"wind":
+			for p in [Vector3(-18, 0, -15.5), Vector3(-2, 0, -15.8), Vector3(18, 0, -15.5)]:
+				cyl(0.18, 0.28, 8.0, p + Vector3(0, 4, 0), Color("#F2F4EF"), v, 8)
+				var hub := Node3D.new()
+				hub.position = p + Vector3(0, 8.1, 0.4)
+				v.add_child(hub)
+				sphere(0.3, Vector3.ZERO, Color("#F2F4EF"), hub)
+				for k in 3:
+					var arm := Node3D.new()
+					arm.rotation.z = k * TAU / 3.0
+					hub.add_child(arm)
+					box(Vector3(0.25, 2.8, 0.08), Vector3(0, 1.4, 0), Color("#F2F4EF"), arm)
+				turbines.append(hub)
+		"firescape":
+			for i in 14:
+				var x := -30.0 + i * 4.6
+				tree(Vector3(x, 0, -13.8), 0.75, v, true)
+		"seagrass":
+			seagrass.visible = true
+			for i in 22:
+				box(Vector3(rng.randf_range(1.5, 3.0), 0.05, rng.randf_range(1, 2)), Vector3(rng.randf_range(-32, 32), -0.05, rng.randf_range(19, 27)), Color("#3E8A55"), seagrass)
+		"fund":
+			box(Vector3(2.2, 0.1, 1.4), Vector3(-3.6, 0.1, 6.3), Color("#24456B"), v, false, mat(Color("#24456B"), 0.2))
+			box(Vector3(2.2, 0.1, 1.4), Vector3(3.6, 0.1, 6.3), Color("#24456B"), v, false, mat(Color("#24456B"), 0.2))
+		"fair":
+			for q in 3:
+				var tent := cyl(0.0, 1.0, 1.4, Vector3(-3 + q * 3, 0.7, -0.6), [C_GOLD, Color("#C79BEA"), C_OK][q], v, 6)
+				tent.name = "tent%d" % q
+		"solarcoop":
+			for r in roofs:
+				var b3: MeshInstance3D = r.get_parent()
+				if b3.position.x < 15.0:
+					var sz3: Vector3 = (b3.mesh as BoxMesh).size
+					var pn := box(Vector3(sz3.x * 0.7, 0.06, sz3.z * 0.5), Vector3.ZERO, Color("#2B4E7A"), v, false, mat(Color("#2B4E7A"), 0.2))
+					pn.global_position = b3.global_position + Vector3(0, sz3.y / 2.0 + 0.3, -0.4)
+
 # =====================================================================
 #  GİRDİ VE DÖNGÜ
 # =====================================================================
-func _on_start() -> void:
+func reset_world_state() -> void:
 	reset_state()
 	for c in visuals.get_children():
 		c.queue_free()
@@ -1306,17 +2007,26 @@ func _on_start() -> void:
 		c.queue_free()
 	seagrass.visible = false
 	siren_light = null
+	turbines = []
 	for r in roofs:
 		r.material_override = mat(Color("#B4553C")) if r.get_parent().position.y < 4.0 or r.get_parent().position.x < 15.0 else mat(Color("#C9C2B0"))
 	(get_node("Mound") as Node3D).scale = Vector3(1.3, 0.5, 1.0)
 	player.position = Vector3(0, 0.1, 8)
+	player_vis.rotation.y = 0.0
+	clear_overlay()
+	refresh_world()
+
+
+func _on_start() -> void:
+	reset_world_state()
+	play_music("main")
 	clear_overlay()
 	phase = "play"
 	cam_mode = "follow"
 	refresh_world()
 	refresh_stations()
 	refresh_hud()
-	toast(t("follow"))
+	toast(t("follow") + "\n" + t("xpHint"))
 
 
 func _on_lang() -> void:
@@ -1329,6 +2039,8 @@ func _on_lang() -> void:
 		"feedback": show_feedback(cur_di, choices[cur_di])
 		"event": show_event_panel()
 		"end": show_end()
+		"tech": open_tech()
+		"menu": open_menu()
 
 
 var cur_di := -1
@@ -1337,7 +2049,26 @@ var cur_di := -1
 func _on_prompt() -> void:
 	if phase == "play" and near_di >= 0:
 		cur_di = near_di
-		open_decision(near_di)
+		phase = "pressing"
+		prompt_btn.visible = false
+		var st: Dictionary = stations[cur_di]
+		var cap: MeshInstance3D = st["cap"]
+		play_sfx("press")
+		var lt := OmniLight3D.new()
+		lt.light_color = C_GOLD
+		lt.omni_range = 7.0
+		lt.light_energy = 0.0
+		st["node"].add_child(lt)
+		lt.position = Vector3(0, 1.8, -1.0)
+		var tw := create_tween()
+		tw.tween_property(cap, "position:y", 0.9, 0.08)
+		tw.parallel().tween_property(lt, "light_energy", 5.0, 0.08)
+		tw.tween_property(cap, "position:y", 1.02, 0.18)
+		tw.parallel().tween_property(lt, "light_energy", 0.0, 0.35)
+		tw.tween_callback(lt.queue_free)
+		await get_tree().create_timer(0.45).timeout
+		if phase == "pressing":
+			open_decision(cur_di)
 
 
 func _on_back() -> void:
@@ -1348,7 +2079,7 @@ func _on_back() -> void:
 
 func _on_choose(di: int, oi: int) -> void:
 	var o: Dictionary = D.DEC[di]["opts"][oi]
-	var c := cost_of(o)
+	var c := option_cost(di, oi)
 	if c > budget:
 		return
 	budget -= c
@@ -1362,6 +2093,9 @@ func _on_choose(di: int, oi: int) -> void:
 			flags.append(f)
 	if o.has("later"):
 		pending.append({"due": round_i + int(o["later"]["due"]), "eff": o["later"]["eff"], "msg": o["later"]["msg"]})
+	var g := xp_for(o)
+	xp += g
+	fly(g, "xp", cam.unproject_position(player.position + Vector3(0, 2.0, 0)))
 	log_list.append({"round": round_i, "di": di, "oi": oi})
 	done[di] = true
 	choices[di] = oi
@@ -1384,14 +2118,17 @@ func _on_feedback_next(round_done: bool) -> void:
 func _on_event_next() -> void:
 	clear_overlay()
 	clear_event_fx()
-	if round_i < 2:
+	if round_i < D.POOLS.size() - 1:
 		round_i += 1
-		budget += 10
+		play_music("main")
+		var inc_now := income()
+		budget += inc_now
+		fly(inc_now, "gold", cam.unproject_position(Vector3(7, 4, -8)))
 		phase = "play"
 		cam_mode = "follow"
 		refresh_stations()
 		refresh_hud()
-		toast(t("period")[round_i])
+		toast("%s   ·   %s +%d" % [t("period")[round_i], t("budget"), income()] + ("\n" + t("xpHint") if any_buyable() else ""))
 	else:
 		show_end()
 
@@ -1437,12 +2174,32 @@ func _on_again() -> void:
 	_on_start()
 
 
+func _input(event: InputEvent) -> void:
+	if event is InputEventKey and event.pressed and not event.echo and event.keycode == KEY_F9:
+		autoplay = not autoplay
+		auto_t = 0.0
+		toast(t("autoOn") if autoplay else t("autoOff"))
+		get_viewport().set_input_as_handled()
+
+
 func _unhandled_input(event: InputEvent) -> void:
+	if event is InputEventKey and event.pressed and not event.echo and event.keycode == KEY_ESCAPE:
+		if phase == "menu":
+			resume_game()
+			return
+		if phase in ["play", "decide", "feedback", "event"]:
+			open_menu()
+			return
+	if phase == "tech" and event is InputEventKey and event.pressed and not event.echo and event.keycode in [KEY_T, KEY_ESCAPE]:
+		close_tech()
+		return
 	if phase != "play":
 		return
 	if event is InputEventKey and event.pressed and not event.echo:
 		if event.keycode in [KEY_E, KEY_SPACE, KEY_ENTER]:
 			_on_prompt()
+		elif event.keycode == KEY_T:
+			open_tech()
 	if event is InputEventMouseButton and event.pressed and event.button_index == MOUSE_BUTTON_LEFT:
 		var from := cam.project_ray_origin(event.position)
 		var dir := cam.project_ray_normal(event.position)
@@ -1543,12 +2300,18 @@ func _physics_process(delta: float) -> void:
 func _process(delta: float) -> void:
 	t_clock += delta
 	# İstasyon animasyonu
-	for s in stations:
+	for si in stations.size():
+		var s: Dictionary = stations[si]
 		if s["node"].visible:
 			s["ring"].rotation.y += delta * 1.2
 			s["ring"].position.y = 0.15 + sin(t_clock * 3.0) * 0.08
+			if phase == "play":
+				var pulse: float = 1.0 + (0.18 * absf(sin(t_clock * 6.0)) if si == near_di else 0.0)
+				s["cap"].scale = Vector3(pulse, 1.0, pulse)
 	if siren_light:
 		siren_light.visible = fmod(t_clock, 1.0) < 0.5
+	for rot in turbines:
+		rot.rotation.z += delta * 2.5
 	if target_marker.visible:
 		target_marker.rotation.y += delta * 2.0
 	# Yakın istasyon ve ok
@@ -1609,7 +2372,22 @@ func run_autoplay(delta: float) -> void:
 			if auto_t > 2.0:
 				auto_t = 0
 				_on_start()
+		"tech":
+			if auto_t > 1.5:
+				auto_t = 0
+				var bought := false
+				for td in D.TECH:
+					if can_buy(td):
+						buy_tech(td["id"])
+						bought = true
+						break
+				if not bought:
+					close_tech()
 		"play":
+			if any_buyable() and auto_t > 0.4:
+				auto_t = 0
+				open_tech()
+				return
 			var no := nearest_open()
 			if no >= 0:
 				var p: Vector2 = D.DEC[no]["pos"]
@@ -1625,7 +2403,7 @@ func run_autoplay(delta: float) -> void:
 				var pick := -1
 				var cands := []
 				for i in opts.size():
-					if cost_of(opts[i]) <= budget:
+					if option_cost(cur_di, i) <= budget:
 						cands.append(i)
 				pick = cands[randi() % cands.size()] if cands.size() > 0 else 2
 				_on_choose(cur_di, pick)
@@ -1648,8 +2426,8 @@ func run_autoplay(delta: float) -> void:
 					if not i in votes:
 						votes.append(i)
 				_on_save()
-				print("AUTOPLAY_END ", stats, " budget=", budget, " tags=", tags, " events=", evlog)
-				if "--autoplay" in OS.get_cmdline_user_args() and not OS.has_feature("web"):
+				print("AUTOPLAY_END ", stats, " budget=", budget, " xp=", xp, " techs=", techs, " events=", evlog)
+				if "--fast" in OS.get_cmdline_user_args() and not OS.has_feature("web"):
 					get_tree().quit()
 		_:
 			auto_t = 0
